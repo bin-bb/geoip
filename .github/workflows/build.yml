@@ -61,8 +61,11 @@ jobs:
           gzip -t "${input_file}"
           current_hash="$(sha256sum "${input_file}" | awk '{print $1}')"
 
-          previous_body="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.body' 2>/dev/null || true)"
-          previous_hash="$(printf '%s\n' "${previous_body}" | sed -n 's/^ipinfo_sha256:[[:space:]]*//p' | head -n 1)"
+          previous_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+          previous_hash="${previous_tag##*-}"
+          if [[ ! "${previous_hash}" =~ ^[0-9a-f]{64}$ ]]; then
+            previous_hash=""
+          fi
 
           echo "source_sha256=${current_hash}" >> "${GITHUB_OUTPUT}"
           echo "input_file=${input_file}" >> "${GITHUB_OUTPUT}"
@@ -136,18 +139,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_tag="ipinfo-$(date -u +%Y%m%d%H%M%S)"
-          release_title="IPinfo Lite GeoIP $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          notes_file="${RUNNER_TEMP}/release-notes.md"
-          {
-            echo "Source: IPinfo Lite (ipinfo_lite.csv.gz)"
-            echo "ipinfo_sha256: ${{ steps.source.outputs.source_sha256 }}"
-            echo "Generated from the final GeoLite2-Country.mmdb using Loyalsoldier/geoip."
-          } > "${notes_file}"
+          taipei_timestamp="$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')"
+          taipei_tag_timestamp="$(TZ=Asia/Taipei date '+%Y%m%d%H%M%S')"
+          release_tag="ipinfo-${taipei_tag_timestamp}-${{ steps.source.outputs.source_sha256 }}"
+          release_title="GeoIP ${taipei_timestamp}"
 
           gh release create "${release_tag}" \
             build/GeoLite2-Country.mmdb \
             build/geoip.dat \
             --title "${release_title}" \
-            --notes-file "${notes_file}" \
+            --notes "" \
             --latest
