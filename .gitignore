@@ -1,0 +1,6 @@
+.cache/
+.dist/
+*.csv.gz
+*.mmdb
+*.dat
+coverage.out
