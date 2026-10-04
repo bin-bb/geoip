@@ -1,0 +1,153 @@
+name: Build GeoIP databases
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every eight hours. GitHub may delay scheduled jobs during high load.
+    - cron: "17 */8 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: geoip-build
+  cancel-in-progress: false
+
+env:
+  IPINFO_DOWNLOAD_URL: https://ipinfo.io/data/ipinfo_lite.csv.gz
+  GEOIP_TOOL_VERSION: v0.0.0-20261001013216-424733bd1324
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download and check IPinfo Lite
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${IPINFO_TOKEN:-}" ]]; then
+            echo "IPINFO_TOKEN is not configured in repository Secrets." >&2
+            exit 1
+          fi
+
+          input_file="${RUNNER_TEMP}/ipinfo_lite.csv.gz"
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --get \
+            --data-urlencode "_src=frontend" \
+            --data-urlencode "token=${IPINFO_TOKEN}" \
+            "${IPINFO_DOWNLOAD_URL}" \
+            --output "${input_file}"
+
+          gzip -t "${input_file}"
+          current_hash="$(sha256sum "${input_file}" | awk '{print $1}')"
+
+          previous_body="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.body' 2>/dev/null || true)"
+          previous_hash="$(printf '%s\n' "${previous_body}" | sed -n 's/^ipinfo_sha256:[[:space:]]*//p' | head -n 1)"
+
+          echo "source_sha256=${current_hash}" >> "${GITHUB_OUTPUT}"
+          echo "input_file=${input_file}" >> "${GITHUB_OUTPUT}"
+
+          if [[ -n "${previous_hash}" && "${current_hash}" == "${previous_hash}" ]]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "IPinfo Lite has not changed; generation skipped."
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            echo "New IPinfo Lite data detected."
+          fi
+
+      - name: Validate source CSV
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "${{ steps.source.outputs.input_file }}" <<'PY'
+          import csv
+          import gzip
+          import sys
+
+          with gzip.open(sys.argv[1], "rt", newline="") as source:
+              header = next(csv.reader(source))
+          required = {"network", "country", "country_code", "continent", "continent_code"}
+          missing = required - set(header)
+          if missing:
+              raise SystemExit(f"missing CSV fields: {sorted(missing)}")
+          PY
+
+      - name: Build GeoLite2-Country.mmdb
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          go run ./cmd/build-country \
+            -input "${{ steps.source.outputs.input_file }}" \
+            -output build/GeoLite2-Country.mmdb.tmp
+          test -s build/GeoLite2-Country.mmdb.tmp
+          mv build/GeoLite2-Country.mmdb.tmp build/GeoLite2-Country.mmdb
+
+      - name: Install Loyalsoldier geoip converter
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install "github.com/Loyalsoldier/geoip@${GEOIP_TOOL_VERSION}"
+
+      - name: Convert MMDB to geoip.dat
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/dat
+          "$(go env GOPATH)/bin/geoip" convert -c .github/geoip-dat.json
+          test -s build/dat/geoip.dat
+          mv build/dat/geoip.dat build/geoip.dat
+
+      - name: Verify MMDB and DAT country sets
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/verify-outputs \
+            -mmdb build/GeoLite2-Country.mmdb \
+            -dat build/geoip.dat
+
+      - name: Publish release
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="ipinfo-$(date -u +%Y%m%d%H%M%S)"
+          release_title="IPinfo Lite GeoIP $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          notes_file="${RUNNER_TEMP}/release-notes.md"
+          {
+            echo "Source: IPinfo Lite (ipinfo_lite.csv.gz)"
+            echo "ipinfo_sha256: ${{ steps.source.outputs.source_sha256 }}"
+            echo "Generated from the final GeoLite2-Country.mmdb using Loyalsoldier/geoip."
+          } > "${notes_file}"
+
+          gh release create "${release_tag}" \
+            build/GeoLite2-Country.mmdb \
+            build/geoip.dat \
+            --title "${release_title}" \
+            --notes-file "${notes_file}" \
+            --latest

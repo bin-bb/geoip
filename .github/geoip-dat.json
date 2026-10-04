@@ -1,0 +1,21 @@
+{
+  "input": [
+    {
+      "type": "maxmindMMDB",
+      "action": "add",
+      "args": {
+        "uri": "./build/GeoLite2-Country.mmdb"
+      }
+    }
+  ],
+  "output": [
+    {
+      "type": "v2rayGeoIPDat",
+      "action": "output",
+      "args": {
+        "outputDir": "./build/dat",
+        "outputName": "geoip.dat"
+      }
+    }
+  ]
+}
